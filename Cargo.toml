@@ -17,8 +17,10 @@ futures-core = { version = "0.3", optional = true }
 libc = "0.2"
 log = "0.4"
 thiserror = "1"
-tokio = { version = "1", features = ["net", "macros"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
+etherparse = { version = "^0.14.0", optional = true }
+smoltcp = { version = "0.11", features = ["proto-ipv4", "proto-ipv6"], optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 ioctl = { version = "0.8", package = "ioctl-sys" }
@@ -29,9 +31,13 @@ wintun = { version = "0.3", features = ["panic_on_unsent_packets"] }
 [dev-dependencies]
 futures = "0.3"
 packet = "0.1"
+smoltcp = { version = "0.11", features = ["proto-ipv4", "proto-ipv6"] }
+env_logger = "0.11.6"
+clap = { version = "4.0", features = ["derive"] }
 
 [features]
 async = ["tokio", "tokio-util", "bytes", "byteorder", "futures-core"]
+offload = ["etherparse", "smoltcp"]
 
 [[example]]
 name = "read-async"
@@ -43,4 +49,12 @@ required-features = ["async", "tokio/rt-multi-thread"]
 
 [[example]]
 name = "ping-tun"
+required-features = ["async", "tokio/rt-multi-thread"]
+
+[[example]]
+name = "read"
+required-features = ["async", "tokio/rt-multi-thread"]
+
+[[example]]
+name = "udp_gso_client"
 required-features = ["async", "tokio/rt-multi-thread"]

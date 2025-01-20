@@ -15,7 +15,7 @@
 //! Bindings to internal Linux stuff.
 
 use ioctl::*;
-use libc::{c_int, ifreq};
+use libc::{c_int, c_uint, ifreq};
 
 ioctl!(bad read siocgifflags with 0x8913; ifreq);
 ioctl!(bad write siocsifflags with 0x8914; ifreq);
@@ -30,6 +30,11 @@ ioctl!(bad write siocsifnetmask with 0x891c; ifreq);
 ioctl!(bad read siocgifmtu with 0x8921; ifreq);
 ioctl!(bad write siocsifmtu with 0x8922; ifreq);
 ioctl!(bad write siocsifname with 0x8923; ifreq);
+
+// #define TUNSETOFFLOAD  _IOW('T', 208, unsigned int)
+ioctl!(write tunsetoffload with b'T', 208; c_uint);
+// #define TUNGETIFF      _IOR('T', 210, unsigned int)
+ioctl!(read tungetifff with b'T', 210; c_uint);
 
 ioctl!(write tunsetiff with b'T', 202; c_int);
 ioctl!(write tunsetpersist with b'T', 203; c_int);

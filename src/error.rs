@@ -49,6 +49,30 @@ pub enum Error {
     #[error(transparent)]
     ParseNum(#[from] num::ParseIntError),
 
+    #[cfg(feature = "offload")]
+    #[error("vnet_hdr error")]
+    VnetHdr,
+
+    #[cfg(feature = "offload")]
+    #[error("buffer too small")]
+    BufferTooSmall,
+
+    #[cfg(feature = "offload")]
+    #[error("offload flow not found")]
+    OffloadFlowNotFound,
+
+    #[cfg(feature = "offload")]
+    #[error("offload item invalid checksum")]
+    OffloadItemInvalidChecksum,
+
+    #[cfg(feature = "offload")]
+    #[error("offload packet invalid checksum")]
+    OffloadPacketInvalidChecksum,
+
+    #[cfg(feature = "offload")]
+    #[error("offload TCP PSH flag set")]
+    OffloadTcpPshFlagSet,
+
     #[cfg(target_os = "windows")]
     #[error(transparent)]
     WintunError(#[from] wintun::Error),

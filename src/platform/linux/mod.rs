@@ -19,6 +19,9 @@ pub mod sys;
 mod device;
 pub use self::device::{Device, Queue};
 
+#[cfg(feature = "offload")]
+pub mod offload;
+
 use crate::configuration::Configuration as C;
 use crate::error::*;
 
@@ -26,6 +29,7 @@ use crate::error::*;
 #[derive(Copy, Clone, Default, Debug)]
 pub struct Configuration {
     pub(crate) packet_information: bool,
+    pub(crate) vnet_hdr: bool,
 }
 
 impl Configuration {
@@ -33,6 +37,11 @@ impl Configuration {
     /// each packet is a header with flags and protocol type.
     pub fn packet_information(&mut self, value: bool) -> &mut Self {
         self.packet_information = value;
+        self
+    }
+
+    pub fn vnet(&mut self, value: bool) -> &mut Self {
+        self.vnet_hdr = value;
         self
     }
 }

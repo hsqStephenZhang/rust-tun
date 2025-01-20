@@ -16,8 +16,12 @@ use std::io;
 
 use byteorder::{NativeEndian, NetworkEndian, WriteBytesExt};
 use bytes::{BufMut, Bytes, BytesMut};
+use log::debug;
 use tokio_util::codec::{Decoder, Encoder};
 
+use crate::platform::linux::offload::{handle_gro, handle_virtio_read, virtio::VirtioNetHeader};
+
+#[allow(unused)]
 /// A packet protocol IP version
 #[derive(Debug, Clone, Copy, Default)]
 enum PacketProtocol {
@@ -72,6 +76,27 @@ fn infer_proto(buf: &[u8]) -> PacketProtocol {
     }
 }
 
+impl From<Bytes> for TunPacket {
+    fn from(bytes: Bytes) -> TunPacket {
+        let proto = infer_proto(&bytes);
+        TunPacket(proto, bytes)
+    }
+}
+
+impl From<Vec<u8>> for TunPacket {
+    fn from(bytes: Vec<u8>) -> TunPacket {
+        let proto = infer_proto(&bytes);
+        TunPacket(proto, Bytes::from(bytes))
+    }
+}
+
+impl From<BytesMut> for TunPacket {
+    fn from(bytes: BytesMut) -> TunPacket {
+        let proto = infer_proto(&bytes);
+        TunPacket(proto, bytes.freeze())
+    }
+}
+
 impl TunPacket {
     /// Create a new `TunPacket` based on a byte slice.
     pub fn new(bytes: Vec<u8>) -> TunPacket {
@@ -90,13 +115,13 @@ impl TunPacket {
 }
 
 /// A TunPacket Encoder/Decoder.
-pub struct TunPacketCodec(bool, i32);
+pub struct TunPacketCodec(bool, bool, i32);
 
 impl TunPacketCodec {
     /// Create a new `TunPacketCodec` specifying whether the underlying
     ///  tunnel Device has enabled the packet information header.
-    pub fn new(pi: bool, mtu: i32) -> TunPacketCodec {
-        TunPacketCodec(pi, mtu)
+    pub fn new(pi: bool, has_vnet_hdr: bool, mtu: i32) -> TunPacketCodec {
+        TunPacketCodec(pi, has_vnet_hdr, mtu)
     }
 }
 
@@ -112,10 +137,14 @@ impl Decoder for TunPacketCodec {
         let mut pkt = buf.split_to(buf.len());
 
         // reserve enough space for the next packet
-        if self.0 {
-            buf.reserve(self.1 as usize + 4);
-        } else {
-            buf.reserve(self.1 as usize);
+        let pi_size = if self.0 { 4 } else { 0 };
+        let virtio_hdr_size = if self.1 { VirtioNetHeader::size() } else { 0 };
+        buf.reserve(self.2 as usize + pi_size + virtio_hdr_size);
+
+        if self.1 {
+            let hdr = VirtioNetHeader::decode(pkt.as_ref()).unwrap();
+            println!("{:?}", hdr);
+            let _ = pkt.split_to(VirtioNetHeader::size());
         }
 
         // if the packet information is enabled we have to ignore the first 4 bytes
@@ -132,19 +161,81 @@ impl Encoder<TunPacket> for TunPacketCodec {
     type Error = io::Error;
 
     fn encode(&mut self, item: TunPacket, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.reserve(item.get_bytes().len() + 4);
+        let pi_reserve = if self.0 { 4 } else { 0 };
+        dst.reserve(item.get_bytes().len() + pi_reserve);
         match item {
             TunPacket(proto, bytes) if self.0 => {
                 // build the packet information header comprising of 2 u16
                 // fields: flags and protocol.
-                let mut buf = Vec::<u8>::with_capacity(4);
+                if self.0 {
+                    let mut buf = Vec::<u8>::with_capacity(4);
 
-                // flags is always 0
-                buf.write_u16::<NativeEndian>(0)?;
-                // write the protocol as network byte order
-                buf.write_u16::<NetworkEndian>(proto.into_pi_field()?)?;
+                    // flags is always 0
+                    buf.write_u16::<NativeEndian>(0)?;
+                    // write the protocol as network byte order
+                    buf.write_u16::<NetworkEndian>(proto.into_pi_field()?)?;
 
-                dst.put_slice(&buf);
+                    dst.put_slice(&buf);
+                }
+
+                dst.put(bytes);
+            }
+            TunPacket(_, bytes) => dst.put(bytes),
+        }
+        Ok(())
+    }
+}
+
+/// A TunPacket Encoder/Decoder.
+pub struct TunPacketCodec2(bool, i32);
+
+impl TunPacketCodec2 {
+    /// Create a new `TunPacketCodec` specifying whether the underlying
+    ///  tunnel Device has enabled the packet information header.
+    pub fn new(has_vnet_hdr: bool, mtu: i32) -> TunPacketCodec2 {
+        TunPacketCodec2(has_vnet_hdr, mtu)
+    }
+}
+
+impl Decoder for TunPacketCodec2 {
+    type Item = Vec<TunPacket>;
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+
+        let mut pkt = buf.split_to(buf.len());
+
+        // reserve enough space for the next packet
+        let virtio_hdr_size = if self.0 { VirtioNetHeader::size() } else { 0 };
+        buf.reserve(self.1 as usize + virtio_hdr_size);
+
+        if self.0 {
+            let hdr = VirtioNetHeader::decode(pkt.as_ref()).unwrap();
+            debug!("{:?}", hdr);
+            let _ = pkt.split_to(VirtioNetHeader::size());
+            let packets = handle_virtio_read(hdr, pkt)?;
+            return Ok(Some(packets));
+        } else {
+            let proto = infer_proto(pkt.as_ref());
+            return Ok(Some(vec![TunPacket(proto, pkt.freeze())]));
+        };
+    }
+}
+
+impl Encoder<TunPacket> for TunPacketCodec2 {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: TunPacket, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.reserve(item.get_bytes().len());
+        match item {
+            TunPacket(_, pkt) if self.0 => {
+                let vnet_hdr = handle_gro(&pkt);
+                let mut bytes = BytesMut::with_capacity(VirtioNetHeader::size() + pkt.len());
+                bytes.put(vnet_hdr.encode().unwrap().as_ref());
+                bytes.put(pkt);
                 dst.put(bytes);
             }
             TunPacket(_, bytes) => dst.put(bytes),

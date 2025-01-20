@@ -13,8 +13,9 @@
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
 use libc::{
-    self, c_char, c_short, ifreq, AF_INET, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_RUNNING, IFF_TAP,
-    IFF_TUN, IFF_UP, IFNAMSIZ, O_RDWR, SOCK_DGRAM,
+    self, c_char, c_short, c_uint, ifreq, AF_INET, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_RUNNING,
+    IFF_TAP, IFF_TUN, IFF_UP, IFF_VNET_HDR, IFNAMSIZ, O_RDWR, SOCK_DGRAM, TUN_F_CSUM, TUN_F_TSO4,
+    TUN_F_TSO6, TUN_F_USO4, TUN_F_USO6,
 };
 use std::{
     ffi::{CStr, CString},
@@ -34,6 +35,10 @@ use crate::{
     platform::linux::sys::*,
     platform::posix::{self, Fd, SockAddr},
 };
+
+const TUN_TCP_OFFLOADS: c_uint = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+const TUN_UDP_OFFLOADS: c_uint = TUN_F_USO4 | TUN_F_USO6;
+const TUN_OFFLOADS: c_uint = TUN_TCP_OFFLOADS | TUN_UDP_OFFLOADS;
 
 /// A TUN device using the TUN/TAP Linux driver.
 pub struct Device {
@@ -81,10 +86,13 @@ impl Device {
 
             let iff_no_pi = IFF_NO_PI as c_short;
             let iff_multi_queue = IFF_MULTI_QUEUE as c_short;
+            let iff_vnet_dhr = IFF_VNET_HDR as c_short;
+            let vnet = config.platform.vnet_hdr;
             let packet_information = config.platform.packet_information;
             req.ifr_ifru.ifru_flags = device_type
                 | if packet_information { 0 } else { iff_no_pi }
-                | if queues_num > 1 { iff_multi_queue } else { 0 };
+                | if queues_num > 1 { iff_multi_queue } else { 0 }
+                | if vnet { iff_vnet_dhr } else { 0 };
 
             for _ in 0..queues_num {
                 let tun = Fd::new(libc::open(b"/dev/net/tun\0".as_ptr() as *const _, O_RDWR))
@@ -94,9 +102,18 @@ impl Device {
                     return Err(io::Error::last_os_error().into());
                 }
 
+                let ret = tungetifff(tun.0, &mut req as *mut _ as *mut _);
+                if ret == 0 && req.ifr_ifru.ifru_flags & IFF_VNET_HDR as c_short != 0 {
+                    // set offload features
+                    if tunsetoffload(tun.0, TUN_OFFLOADS as _) < 0 {
+                        return Err(io::Error::last_os_error().into());
+                    }
+                }
+
                 queues.push(Queue {
                     tun,
                     pi_enabled: config.platform.packet_information,
+                    vnet_hdr: config.platform.vnet_hdr,
                 });
             }
 
@@ -161,6 +178,10 @@ impl Device {
     /// Return whether the device has packet information
     pub fn has_packet_information(&mut self) -> bool {
         self.queues[0].has_packet_information()
+    }
+
+    pub fn has_vnet_hdr(&mut self) -> bool {
+        self.queues[0].has_vnet_hdr()
     }
 
     /// Split the interface into a `Reader` and `Writer`.
@@ -400,6 +421,7 @@ impl IntoRawFd for Device {
 pub struct Queue {
     tun: Fd,
     pi_enabled: bool,
+    vnet_hdr: bool,
 }
 
 impl Queue {
@@ -409,6 +431,10 @@ impl Queue {
 
     pub fn set_nonblock(&self) -> io::Result<()> {
         self.tun.set_nonblock()
+    }
+
+    pub fn has_vnet_hdr(&mut self) -> bool {
+        self.vnet_hdr
     }
 }
 

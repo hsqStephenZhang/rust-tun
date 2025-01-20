@@ -52,7 +52,15 @@ impl AsyncDevice {
     /// Consumes this AsyncDevice and return a Framed object (unified Stream and Sink interface)
     pub fn into_framed(mut self) -> Framed<Self, TunPacketCodec> {
         let pi = self.get_mut().has_packet_information();
-        let codec = TunPacketCodec::new(pi, self.inner.get_ref().mtu().unwrap_or(1504));
+        let vnet_hdr = self.get_mut().has_vnet_hdr();
+        let codec = TunPacketCodec::new(pi, vnet_hdr, self.inner.get_ref().mtu().unwrap_or(1504));
+        Framed::new(self, codec)
+    }
+
+    pub fn into_framed2(mut self) -> Framed<Self, TunPacketCodec2> {
+        let pi = self.get_mut().has_packet_information();
+        let vnet_hdr = self.get_mut().has_vnet_hdr();
+        let codec = TunPacketCodec2::new(vnet_hdr, self.inner.get_ref().mtu().unwrap_or(1504));
         Framed::new(self, codec)
     }
 }
@@ -148,7 +156,8 @@ impl AsyncQueue {
     /// Consumes this AsyncQueue and return a Framed object (unified Stream and Sink interface)
     pub fn into_framed(mut self) -> Framed<Self, TunPacketCodec> {
         let pi = self.get_mut().has_packet_information();
-        let codec = TunPacketCodec::new(pi, 1504);
+        let has_vnet_hdr = self.get_mut().has_vnet_hdr();
+        let codec = TunPacketCodec::new(pi, has_vnet_hdr, 1504);
         Framed::new(self, codec)
     }
 }
