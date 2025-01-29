@@ -79,7 +79,6 @@ impl VirtioNetHeader {
         }
 
         let hdr = &data[..VIRTIO_NET_HEADER_SIZE];
-        println!("gso_type origin: {:?}", hdr[1]);
         let flags = hdr[0];
         let gso_type = hdr[1];
         let header_len = u16::from_le_bytes([hdr[2], hdr[3]]);
@@ -96,7 +95,7 @@ impl VirtioNetHeader {
         })
     }
 
-    pub fn encode(&self) -> Result<[u8; VIRTIO_NET_HEADER_SIZE]> {
+    pub fn encode(&self) -> [u8; VIRTIO_NET_HEADER_SIZE] {
         let mut buf = [0u8; VIRTIO_NET_HEADER_SIZE];
         buf[0] = self.flags;
         buf[1] = self.gso_type;
@@ -105,6 +104,6 @@ impl VirtioNetHeader {
         buf[6..8].copy_from_slice(&self.checksum_start.to_le_bytes());
         buf[8..10].copy_from_slice(&self.checksum_offset.to_le_bytes());
 
-        Ok(buf)
+        buf
     }
 }

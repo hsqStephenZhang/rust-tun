@@ -16,7 +16,6 @@ use std::io;
 
 use byteorder::{NativeEndian, NetworkEndian, WriteBytesExt};
 use bytes::{BufMut, Bytes, BytesMut};
-use log::debug;
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::platform::linux::offload::{handle_gro, handle_virtio_read, virtio::VirtioNetHeader};
@@ -214,7 +213,6 @@ impl Decoder for TunPacketCodec2 {
 
         if self.0 {
             let hdr = VirtioNetHeader::decode(pkt.as_ref()).unwrap();
-            debug!("{:?}", hdr);
             let _ = pkt.split_to(VirtioNetHeader::size());
             let packets = handle_virtio_read(hdr, pkt)?;
             return Ok(Some(packets));
@@ -229,14 +227,14 @@ impl Encoder<TunPacket> for TunPacketCodec2 {
     type Error = io::Error;
 
     fn encode(&mut self, item: TunPacket, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.reserve(item.get_bytes().len());
+        let vnet_hdr_size = if self.0 { VirtioNetHeader::size() } else { 0 };
+        dst.reserve(item.get_bytes().len() + vnet_hdr_size);
         match item {
             TunPacket(_, pkt) if self.0 => {
-                let vnet_hdr = handle_gro(&pkt);
-                let mut bytes = BytesMut::with_capacity(VirtioNetHeader::size() + pkt.len());
-                bytes.put(vnet_hdr.encode().unwrap().as_ref());
-                bytes.put(pkt);
-                dst.put(bytes);
+                let mut pkt_mut = BytesMut::from(pkt);
+                let vnet_hdr = handle_gro(&mut pkt_mut);
+                dst.put(vnet_hdr.encode().as_slice());
+                dst.put(pkt_mut);
             }
             TunPacket(_, bytes) => dst.put(bytes),
         }

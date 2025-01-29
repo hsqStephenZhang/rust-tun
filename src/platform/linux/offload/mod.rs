@@ -1,7 +1,6 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::BytesMut;
 use checksum::partial_csum;
-use log::debug;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use virtio::{VirtioNetHeader, VIRTIO_NET_HDR_F_NEEDS_CSUM};
 
@@ -20,6 +19,7 @@ pub fn handle_virtio_read(
     mut hdr: VirtioNetHeader,
     mut buf: BytesMut,
 ) -> std::io::Result<Vec<TunPacket>> {
+    log::trace!("handle_virtio_read, hdr: {:?}, buf len: {}", hdr, buf.len());
     let mut packets = vec![];
 
     // 1. check the solidity of the hdr
@@ -40,6 +40,8 @@ pub fn handle_virtio_read(
                 csum,
             );
         }
+        #[cfg(debug_assertions)]
+        verify(&buf);
         let packet = TunPacket::from(Into::<bytes::Bytes>::into(buf));
         return Ok(vec![packet]);
     }
@@ -87,11 +89,14 @@ pub fn handle_virtio_read(
     let gso_size = hdr.gso_size as usize;
 
     let is_ipv6 = buf[0] >> 4 == 6;
+    // clear ipv4 checksum
     if !is_ipv6 {
-        // clear checksum
         buf[10] = 0;
         buf[11] = 0;
     }
+    // clear transport layer checksum
+    buf[checksum_start + checksum_offset] = 0;
+    buf[checksum_start + checksum_offset + 1] = 0;
 
     let (src, dst) = if is_ipv6 {
         let src = Ipv6Address::from_bytes(&buf[8..24]);
@@ -120,7 +125,6 @@ pub fn handle_virtio_read(
         let split_payload = &buf[start..packet_end];
         let total_len = header_len + split_payload.len();
         assert!(total_len <= u16::MAX as usize);
-        println!("total len: {}, start: {}", total_len, start);
         new_packet.reserve(total_len);
         new_packet.extend_from_slice(&buf[0..checksum_start]);
 
@@ -129,8 +133,7 @@ pub fn handle_virtio_read(
             NetworkEndian::write_u16(&mut new_packet[2..4], total_len as u16);
             NetworkEndian::write_u16(&mut new_packet[4..6], identification + i as u16);
 
-            // TODO: calculate the checksum
-            let ip_checksum: u16 = checksum::data(&new_packet[..checksum_start]);
+            let ip_checksum: u16 = !checksum::data(&new_packet[..checksum_start]);
             NetworkEndian::write_u16(&mut new_packet[10..12], ip_checksum);
         } else {
             // for ipv6, we just need to set the total length
@@ -186,7 +189,7 @@ pub fn handle_virtio_read(
             split_payload.len(),
             header_len
         );
-        #[cfg(test)]
+        #[cfg(debug_assertions)]
         verify(&new_packet);
         packets.push(new_packet.into());
     }
@@ -194,85 +197,16 @@ pub fn handle_virtio_read(
     Ok(packets)
 }
 
-// merging requirements: tools/testing/selftests/net/gro.c
-// we donnot trust the userspace network stack's checksum
-/// buf: the ip packet (with all fields filled)
-pub fn handle_gro(pkt: &[u8]) -> VirtioNetHeader {
-    let mut vnet_hdr = VirtioNetHeader::default();
-    vnet_hdr.flags = virtio::VIRTIO_NET_HDR_F_NEEDS_CSUM;
-
-    match pkt[0] >> 4 {
-        4 => {
-            handle_ipv4(&mut vnet_hdr, pkt);
-        }
-        6 => {
-            handle_ipv6(&mut vnet_hdr, pkt);
-        }
-        _ => panic!(""),
-    }
-
-    debug!("after processing {:?}, packet len: {}", vnet_hdr, pkt.len());
-    return vnet_hdr;
-
-    fn handle_ipv4(hdr: &mut VirtioNetHeader, pkt: &[u8]) {
-        let ip = smoltcp::wire::Ipv4Packet::new_checked(pkt);
-        assert!(ip.is_ok(), "error {:?}", ip.unwrap_err());
-        let ip = ip.unwrap();
-        hdr.checksum_start = ip.header_len() as _;
-        hdr.header_len = hdr.checksum_start;
-
-        match ip.next_header() {
-            smoltcp::wire::IpProtocol::Tcp => handle_tcp(hdr, ip.payload(), false),
-            smoltcp::wire::IpProtocol::Udp => handle_udp(hdr, ip.payload()),
-            _ => panic!(""),
-        }
-    }
-
-    fn handle_ipv6(hdr: &mut VirtioNetHeader, pkt: &[u8]) {
-        let ip = smoltcp::wire::Ipv6Packet::new_checked(pkt);
-        assert!(ip.is_ok(), "error {:?}", ip.unwrap_err());
-        let ip = ip.unwrap();
-
-        hdr.checksum_start = ip.header_len() as _;
-        hdr.header_len = hdr.checksum_start;
-
-        match ip.next_header() {
-            smoltcp::wire::IpProtocol::Tcp => handle_tcp(hdr, ip.payload(), true),
-            smoltcp::wire::IpProtocol::Udp => handle_udp(hdr, ip.payload()),
-            _ => panic!(""),
-        }
-    }
-
-    fn handle_tcp(hdr: &mut VirtioNetHeader, upper: &[u8], is_v6: bool) {
-        let tcp = smoltcp::wire::TcpPacket::new_checked(upper);
-        assert!(tcp.is_ok(), "error {:?}", tcp.unwrap_err());
-        let tcp = tcp.unwrap();
-        hdr.gso_type = if is_v6 {
-            virtio::VIRTIO_NET_HDR_GSO_TCPV6
-        } else {
-            virtio::VIRTIO_NET_HDR_GSO_TCPV4
-        };
-        hdr.header_len += tcp.header_len() as u16;
-        hdr.checksum_offset = 16;
-        hdr.gso_size = tcp.payload().len() as u16;
-    }
-
-    fn handle_udp(hdr: &mut VirtioNetHeader, pkt: &[u8]) {
-        let udp = smoltcp::wire::UdpPacket::new_checked(pkt);
-        if let Err(_) = udp {
-            let udp = smoltcp::wire::UdpPacket::new_unchecked(pkt);
-            log::debug!("buffer len: {}, udp packet len: {}", pkt.len(), udp.len());
-        }
-        assert!(udp.is_ok(), "error {:?}", udp.unwrap_err());
-        let udp = udp.unwrap();
-        hdr.gso_type = virtio::VIRTIO_NET_HDR_GSO_UDP_L4;
-        hdr.header_len += 8;
-        hdr.checksum_offset = 6;
-        hdr.gso_size = udp.payload().len() as u16;
-    }
+/// merging requirements: tools/testing/selftests/net/gro.c
+/// it's too harsh, so the basic idea is to let the kernel handle GRO 
+/// in `napi_gro_receive` for us with IFF_NAPI set
+/// `wireguard-go` handle it by hand, with tons of tests, but i doubt 
+/// the necessity and reward
+pub fn handle_gro(_pkt: &mut [u8]) -> VirtioNetHeader {
+    return VirtioNetHeader::default();
 }
 
-#[cfg(test)]
+#[cfg(debug_assertions)]
 fn verify(pkt: &[u8]) {
     match pkt[0] >> 4 {
         4 => {
@@ -281,14 +215,14 @@ fn verify(pkt: &[u8]) {
         6 => {
             verify_ipv6(pkt);
         }
-        _ => panic!(""),
+        _ => {}
     }
 
     fn verify_ipv4(pkt: &[u8]) {
         let ip = smoltcp::wire::Ipv4Packet::new_checked(pkt);
         assert!(ip.is_ok(), "error {:?}", ip.unwrap_err());
         let ip = ip.unwrap();
-        ip.verify_checksum();
+        assert!(ip.verify_checksum());
         match ip.next_header() {
             smoltcp::wire::IpProtocol::Tcp => {
                 verify_tcp(ip.payload(), ip.src_addr().into(), ip.dst_addr().into())
@@ -296,7 +230,7 @@ fn verify(pkt: &[u8]) {
             smoltcp::wire::IpProtocol::Udp => {
                 verify_udp(ip.payload(), ip.src_addr().into(), ip.dst_addr().into())
             }
-            _ => panic!(""),
+            _ => {}
         }
     }
 
@@ -313,7 +247,7 @@ fn verify(pkt: &[u8]) {
             smoltcp::wire::IpProtocol::Udp => {
                 verify_udp(ip.payload(), ip.src_addr().into(), ip.dst_addr().into())
             }
-            _ => panic!(""),
+            _ => {}
         }
     }
 
@@ -321,7 +255,24 @@ fn verify(pkt: &[u8]) {
         let tcp = smoltcp::wire::TcpPacket::new_checked(upper);
         assert!(tcp.is_ok(), "error {:?}", tcp.unwrap_err());
         let tcp = tcp.unwrap();
-        tcp.verify_checksum(&src, &dst);
+        assert!(tcp.verify_checksum(&src, &dst));
+
+        log::debug!(
+            "verify_tcp, seq:{}, ack: {}, ports {}->{}, payload: {}",
+            tcp.seq_number(),
+            tcp.ack_number(),
+            tcp.src_port(),
+            tcp.dst_port(),
+            tcp.payload().len()
+        );
+        log::debug!(
+            "verify_tcp flags: fin: {}, syn: {}, rst: {}, psh: {} ack: {}",
+            tcp.fin(),
+            tcp.syn(),
+            tcp.rst(),
+            tcp.psh(),
+            tcp.ack()
+        );
     }
 
     fn verify_udp(pkt: &[u8], src: IpAddress, dst: IpAddress) {
@@ -332,7 +283,7 @@ fn verify(pkt: &[u8]) {
         }
         assert!(udp.is_ok(), "error {:?}", udp.unwrap_err());
         let udp = udp.unwrap();
-        udp.verify_checksum(&src, &dst);
+        assert!(udp.verify_checksum(&src, &dst));
     }
 }
 

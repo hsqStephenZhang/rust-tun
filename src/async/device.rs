@@ -58,7 +58,6 @@ impl AsyncDevice {
     }
 
     pub fn into_framed2(mut self) -> Framed<Self, TunPacketCodec2> {
-        let pi = self.get_mut().has_packet_information();
         let vnet_hdr = self.get_mut().has_vnet_hdr();
         let codec = TunPacketCodec2::new(vnet_hdr, self.inner.get_ref().mtu().unwrap_or(1504));
         Framed::new(self, codec)
