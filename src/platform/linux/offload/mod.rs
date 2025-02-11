@@ -1,7 +1,6 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::BytesMut;
 use checksum::partial_csum;
-use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use virtio::{VirtioNetHeader, VIRTIO_NET_HDR_F_NEEDS_CSUM};
 
 use crate::TunPacket;
@@ -12,6 +11,41 @@ const TCP_FLAGS_OFFSET: usize = 13;
 
 const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_PSH: u8 = 0x08;
+
+const IP_PROTO_UDP: u8 = 17;
+const IP_PROTO_TCP: u8 = 6;
+
+pub struct Ipv4Address(pub [u8; 4]);
+
+impl Ipv4Address {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut addr = [0u8; 4];
+        addr.copy_from_slice(bytes);
+        Ipv4Address(addr)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+pub struct Ipv6Address(pub [u8; 16]);
+
+impl Ipv6Address {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut addr = [0u8; 16];
+        addr.copy_from_slice(bytes);
+        Ipv6Address(addr)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+pub enum IpAddress {
+    Ipv4(Ipv4Address),
+    Ipv6(Ipv6Address),
+}
 
 /// hdr: the virtio header splited from the original buf
 /// buf: the packet splited of the virtio header
@@ -40,8 +74,6 @@ pub fn handle_virtio_read(
                 csum,
             );
         }
-        #[cfg(debug_assertions)]
-        verify(&buf);
         let packet = TunPacket::from(Into::<bytes::Bytes>::into(buf));
         return Ok(vec![packet]);
     }
@@ -71,11 +103,11 @@ pub fn handle_virtio_read(
         unreachable!()
     };
     let protocol = if hdr.gso_type == virtio::VIRTIO_NET_HDR_GSO_UDP_L4 {
-        smoltcp::wire::IpProtocol::Udp
+        IP_PROTO_UDP
     } else {
-        smoltcp::wire::IpProtocol::Tcp
+        IP_PROTO_TCP
     };
-    let tcp_seq = if protocol == smoltcp::wire::IpProtocol::Tcp {
+    let tcp_seq = if protocol == IP_PROTO_TCP {
         Some(NetworkEndian::read_u32(
             &buf[hdr.checksum_start as usize + 4..hdr.checksum_start as usize + 8],
         ))
@@ -146,12 +178,12 @@ pub fn handle_virtio_read(
 
         new_packet.extend(&buf[checksum_start..hdr.header_len as usize]);
 
-        if protocol == smoltcp::wire::IpProtocol::Udp {
+        if protocol == IP_PROTO_UDP{
             NetworkEndian::write_u16(
                 &mut new_packet[checksum_start + 4..checksum_start + 6],
                 8 + split_payload.len() as u16,
             );
-        } else if protocol == smoltcp::wire::IpProtocol::Tcp {
+        } else if protocol == IP_PROTO_TCP {
             // seq
             let tcp_seq_start = tcp_seq.unwrap() + i * gso_size as u32;
             NetworkEndian::write_u32(
@@ -189,8 +221,6 @@ pub fn handle_virtio_read(
             split_payload.len(),
             header_len
         );
-        #[cfg(debug_assertions)]
-        verify(&new_packet);
         packets.push(new_packet.into());
     }
 
@@ -202,94 +232,13 @@ pub fn handle_virtio_read(
 /// in `napi_gro_receive` for us with IFF_NAPI set
 /// `wireguard-go` handle it by hand, with tons of tests, but i doubt 
 /// the necessity and reward
-pub fn handle_gro(_pkt: &mut [u8]) -> VirtioNetHeader {
+pub fn handle_gro(_pkt: &[u8]) -> VirtioNetHeader {
     return VirtioNetHeader::default();
-}
-
-#[cfg(debug_assertions)]
-fn verify(pkt: &[u8]) {
-    match pkt[0] >> 4 {
-        4 => {
-            verify_ipv4(pkt);
-        }
-        6 => {
-            verify_ipv6(pkt);
-        }
-        _ => {}
-    }
-
-    fn verify_ipv4(pkt: &[u8]) {
-        let ip = smoltcp::wire::Ipv4Packet::new_checked(pkt);
-        assert!(ip.is_ok(), "error {:?}", ip.unwrap_err());
-        let ip = ip.unwrap();
-        assert!(ip.verify_checksum());
-        match ip.next_header() {
-            smoltcp::wire::IpProtocol::Tcp => {
-                verify_tcp(ip.payload(), ip.src_addr().into(), ip.dst_addr().into())
-            }
-            smoltcp::wire::IpProtocol::Udp => {
-                verify_udp(ip.payload(), ip.src_addr().into(), ip.dst_addr().into())
-            }
-            _ => {}
-        }
-    }
-
-    fn verify_ipv6(pkt: &[u8]) {
-        let ip = smoltcp::wire::Ipv6Packet::new_checked(pkt);
-        assert!(ip.is_ok(), "error {:?}", ip.unwrap_err());
-        let ip = ip.unwrap();
-        // ipv6 has no need of verifying checksum
-
-        match ip.next_header() {
-            smoltcp::wire::IpProtocol::Tcp => {
-                verify_tcp(ip.payload(), ip.src_addr().into(), ip.dst_addr().into())
-            }
-            smoltcp::wire::IpProtocol::Udp => {
-                verify_udp(ip.payload(), ip.src_addr().into(), ip.dst_addr().into())
-            }
-            _ => {}
-        }
-    }
-
-    fn verify_tcp(upper: &[u8], src: IpAddress, dst: IpAddress) {
-        let tcp = smoltcp::wire::TcpPacket::new_checked(upper);
-        assert!(tcp.is_ok(), "error {:?}", tcp.unwrap_err());
-        let tcp = tcp.unwrap();
-        assert!(tcp.verify_checksum(&src, &dst));
-
-        log::debug!(
-            "verify_tcp, seq:{}, ack: {}, ports {}->{}, payload: {}",
-            tcp.seq_number(),
-            tcp.ack_number(),
-            tcp.src_port(),
-            tcp.dst_port(),
-            tcp.payload().len()
-        );
-        log::debug!(
-            "verify_tcp flags: fin: {}, syn: {}, rst: {}, psh: {} ack: {}",
-            tcp.fin(),
-            tcp.syn(),
-            tcp.rst(),
-            tcp.psh(),
-            tcp.ack()
-        );
-    }
-
-    fn verify_udp(pkt: &[u8], src: IpAddress, dst: IpAddress) {
-        let udp = smoltcp::wire::UdpPacket::new_checked(pkt);
-        if let Err(_) = udp {
-            let udp = smoltcp::wire::UdpPacket::new_unchecked(pkt);
-            log::debug!("buffer len: {}, udp packet len: {}", pkt.len(), udp.len());
-        }
-        assert!(udp.is_ok(), "error {:?}", udp.unwrap_err());
-        let udp = udp.unwrap();
-        assert!(udp.verify_checksum(&src, &dst));
-    }
 }
 
 pub mod checksum {
     use byteorder::{ByteOrder, NetworkEndian};
-    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
+    use super::{IpAddress, Ipv4Address, Ipv6Address};
 
     const fn propagate_carries(mut word: u32) -> u16 {
         word = (word >> 16) + (word & 0xffff);
@@ -338,7 +287,7 @@ pub mod checksum {
     pub fn pseudo_header_v4(
         src_addr: &Ipv4Address,
         dst_addr: &Ipv4Address,
-        next_header: IpProtocol,
+        next_header: u8,
         length: u32,
     ) -> u16 {
         let mut proto_len = [0u8; 4];
@@ -355,7 +304,7 @@ pub mod checksum {
     pub fn pseudo_header_v6(
         src_addr: &Ipv6Address,
         dst_addr: &Ipv6Address,
-        next_header: IpProtocol,
+        next_header: u8,
         length: u32,
     ) -> u16 {
         let mut proto_len = [0u8; 4];
@@ -372,7 +321,7 @@ pub mod checksum {
     pub fn pseudo_header(
         src_addr: &IpAddress,
         dst_addr: &IpAddress,
-        next_header: IpProtocol,
+        next_header: u8,
         length: u32,
     ) -> u16 {
         match (src_addr, dst_addr) {
@@ -390,7 +339,7 @@ pub mod checksum {
     pub fn partial_csum(
         src_addr: &IpAddress,
         dst_addr: &IpAddress,
-        next_header: IpProtocol,
+        next_header: u8,
         length: u32,
         header: &[u8],
     ) -> u16 {

@@ -57,9 +57,9 @@ impl AsyncDevice {
         Framed::new(self, codec)
     }
 
-    pub fn into_framed2(mut self) -> Framed<Self, TunPacketCodec2> {
+    pub fn into_framed_vec(mut self) -> Framed<Self, TunPacketVecCodec> {
         let vnet_hdr = self.get_mut().has_vnet_hdr();
-        let codec = TunPacketCodec2::new(vnet_hdr, self.inner.get_ref().mtu().unwrap_or(1504));
+        let codec = TunPacketVecCodec::new(vnet_hdr, self.inner.get_ref().mtu().unwrap_or(1504));
         Framed::new(self, codec)
     }
 }

@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dev = tun::create_as_async(&config)?;
 
-    let framed = dev.into_framed2();
+    let framed = dev.into_framed_vec();
     let (mut writer, mut reader) = framed.split();
 
     while let Some(packets) = reader.next().await {
